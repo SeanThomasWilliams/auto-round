@@ -23,9 +23,13 @@ from auto_round.schemes import QuantizationScheme, preset_name_to_scheme
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
     check_to_quantized,
+    dispatch_model_no_offload_aware,
     get_block_names,
+    get_major_device,
     get_layer_features,
     get_module,
+    is_single_device_no_offload,
+    materialize_model_on_device,
     is_hpex_available,
     normalize_no_split_modules,
     parse_available_devices,
@@ -219,16 +223,24 @@ def dispatch_model_by_all_available_devices(
 ) -> torch.nn.Module:
     if device_map is None:
         device_map = 0
+    requested_device_map = device_map
 
     no_split_modules = normalize_no_split_modules(getattr(model, "_no_split_modules", []))
     if device_map == "auto":
+        if is_single_device_no_offload(requested_device_map):
+            return materialize_model_on_device(model, get_major_device(requested_device_map))
         max_memory = get_balanced_memory(
             model,
             max_memory=None,
             no_split_module_classes=no_split_modules,
         )
         device_map = infer_auto_device_map(model, max_memory=max_memory, no_split_module_classes=no_split_modules)
-        model = dispatch_model(model, device_map=device_map)
+        model = dispatch_model_no_offload_aware(
+            model,
+            device_map=device_map,
+            requested_device_map=requested_device_map,
+            target_device=get_major_device(requested_device_map),
+        )
         return model
 
     devices = parse_available_devices(device_map)
@@ -258,7 +270,12 @@ def dispatch_model_by_all_available_devices(
         new_max_memory[device] = max_memory[device]
     model.tie_weights()
     device_map = infer_auto_device_map(model, max_memory=max_memory, no_split_module_classes=no_split_modules)
-    model = dispatch_model(model, device_map=device_map)
+    model = dispatch_model_no_offload_aware(
+        model,
+        device_map=device_map,
+        requested_device_map=requested_device_map,
+        target_device=get_major_device(requested_device_map),
+    )
     return model
 
 

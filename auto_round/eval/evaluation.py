@@ -16,7 +16,7 @@ import os
 from typing import Optional, Union
 
 from auto_round.logger import logger
-from auto_round.utils import dispatch_model_block_wise
+from auto_round.utils import dispatch_model_block_wise, dispatch_model_no_offload_aware
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -228,9 +228,7 @@ def prepare_model_for_eval(model, device_map, eval_model_dtype):
 
     # Handle multi-device model
     if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
-        from accelerate.big_modeling import dispatch_model
-
-        dispatch_model(model, model.hf_device_map)
+        dispatch_model_no_offload_aware(model, model.hf_device_map, requested_device_map=device_map)
     else:
         dispatch_model_block_wise(model, device_map)
 

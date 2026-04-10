@@ -111,7 +111,10 @@ from auto_round.utils import (
 )
 from auto_round.utils.device import (
     clear_memory_if_reached_threshold,
+    dispatch_model_no_offload_aware,
     get_major_device,
+    is_single_device_no_offload,
+    materialize_model_on_device,
     parse_available_devices,
     set_auto_device_map_for_block_with_tuning,
     set_non_auto_device_map,
@@ -673,19 +676,11 @@ class BaseCompressor(object):
             raise TypeError(f"device_map should be [str, torch.device, int, dict], but got {type(device_map)}")
 
     def _is_single_device_no_offload(self) -> bool:
-        if not envs.AR_DISABLE_OFFLOAD:
-            return False
-        devices = parse_available_devices(self.device_map)
-        return len(devices) == 1 and all(str(device) != "cpu" for device in devices)
+        return is_single_device_no_offload(self.device_map)
 
     def _materialize_model_on_device(self, model: Optional[torch.nn.Module] = None) -> torch.nn.Module:
         model = self.model if model is None else model
-        if hasattr(model, "hf_device_map"):
-            accelerate.hooks.remove_hook_from_submodules(model)
-        model = model.to(self.device)
-        if hasattr(model, "hf_device_map"):
-            model.hf_device_map = {"": self.device}
-        return model
+        return materialize_model_on_device(model, self.device)
 
     def _reconcile_bits_and_dtype(self, config: dict, prefix: str = ""):
         """
@@ -1184,7 +1179,12 @@ class BaseCompressor(object):
             if self._is_single_device_no_offload():
                 model = self._materialize_model_on_device(model)
             else:
-                model = dispatch_model(model, model.hf_device_map)
+                model = dispatch_model_no_offload_aware(
+                    model,
+                    model.hf_device_map,
+                    requested_device_map=self.device_map,
+                    target_device=self.device,
+                )
             self.model = model
 
         def register_act_hook(model):
@@ -1846,9 +1846,13 @@ class BaseCompressor(object):
                 all_first_block_names, self.nsamples, layer_names=layer_names
             )
         # Remove accelerate dispatch hooks before moving parameters.
-        # hf_device_map is kept for reference but hooks are no longer needed.
+        # In single-device UMA mode, reset hf_device_map now so stale CPU entries
+        # cannot be reused by later layer-cache redispatch paths.
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-            accelerate.hooks.remove_hook_from_submodules(self.model)
+            if self._is_single_device_no_offload():
+                self.model = self._materialize_model_on_device()
+            else:
+                accelerate.hooks.remove_hook_from_submodules(self.model)
         self.model = mv_module_from_gpu(self.model)
         clear_memory(device_list=self.device_list)
         logger.info("caching done")
@@ -2001,15 +2005,23 @@ class BaseCompressor(object):
             if self._is_single_device_no_offload():
                 self.model = self._materialize_model_on_device()
             else:
-                self.model = dispatch_model(self.model, self.model.hf_device_map)
+                self.model = dispatch_model_no_offload_aware(
+                    self.model,
+                    self.model.hf_device_map,
+                    requested_device_map=self.device_map,
+                    target_device=self.device,
+                )
 
         if enable_quanted_input:
             logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
             q_layer_inputs = self.try_cache_inter_data_gpucpu([], self.nsamples, layer_names=layer_names)
             if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-                accelerate.hooks.remove_hook_from_submodules(
-                    self.model
-                )  # self.model.hf_device_map has not been changed
+                if self._is_single_device_no_offload():
+                    self.model = self._materialize_model_on_device()
+                else:
+                    accelerate.hooks.remove_hook_from_submodules(
+                        self.model
+                    )  # self.model.hf_device_map has not been changed
         if not self.is_immediate_saving:
             self.model = mv_module_from_gpu(self.model)
         clear_memory(device_list=self.device_list)
@@ -2301,7 +2313,12 @@ class BaseCompressor(object):
                     if no_offload_single_device:
                         self.model = self._materialize_model_on_device()
                     else:
-                        self.model = dispatch_model(self.model, device_map=self.model.hf_device_map)
+                        self.model = dispatch_model_no_offload_aware(
+                            self.model,
+                            device_map=self.model.hf_device_map,
+                            requested_device_map=self.device_map,
+                            target_device=self.device,
+                        )
                 else:
                     # Change this if new device is supported
                     if no_offload_single_device:
@@ -2360,15 +2377,23 @@ class BaseCompressor(object):
 
                         try:
 
-                            self.model = dispatch_model(self.model, device_map=device_map)
+                            self.model = dispatch_model_no_offload_aware(
+                                self.model,
+                                device_map=device_map,
+                                requested_device_map=self.device_map,
+                                target_device=self.device,
+                            )
                         except ValueError as e:
                             if "offload_dir" in e.__str__():
                                 logger.warning(
                                     f"Due to insufficient resources, disk is used to store the model."
                                     f" `offload_dir={envs.AR_WORK_SPACE}`"
                                 )
-                                self.model = dispatch_model(
-                                    self.model, device_map=device_map, offload_dir=envs.AR_WORK_SPACE
+                                self.model = dispatch_model_no_offload_aware(
+                                    self.model,
+                                    device_map=device_map,
+                                    requested_device_map=self.device_map,
+                                    target_device=self.device,
                                 )
                             else:
                                 raise

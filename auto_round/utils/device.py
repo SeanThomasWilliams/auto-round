@@ -31,6 +31,7 @@ import torch
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory, get_max_memory
 
+from auto_round import envs
 from auto_round.logger import logger
 from auto_round.utils.model import check_to_quantized, get_block_names, get_layer_features, get_module
 
@@ -793,6 +794,39 @@ def get_major_device(device_map: Union[None, str, torch.device, int, dict]) -> s
     return "cpu"
 
 
+def is_single_device_no_offload(device_map: Union[None, str, torch.device, int, dict]) -> bool:
+    if not envs.AR_DISABLE_OFFLOAD:
+        return False
+    devices = parse_available_devices(device_map)
+    return len(devices) == 1 and all(not str(device).startswith("cpu") for device in devices)
+
+
+def materialize_model_on_device(model: torch.nn.Module, device: Union[str, torch.device, int]) -> torch.nn.Module:
+    target_device = detect_device(device)
+    if hasattr(model, "hf_device_map"):
+        import accelerate
+
+        accelerate.hooks.remove_hook_from_submodules(model)
+    model = model.to(target_device)
+    if hasattr(model, "hf_device_map"):
+        model.hf_device_map = {"": target_device}
+    return model
+
+
+def dispatch_model_no_offload_aware(
+    model: torch.nn.Module,
+    device_map,
+    requested_device_map=None,
+    target_device: Optional[Union[str, torch.device, int]] = None,
+):
+    requested_device_map = device_map if requested_device_map is None else requested_device_map
+    if is_single_device_no_offload(requested_device_map):
+        if target_device is None:
+            target_device = get_major_device(requested_device_map)
+        return materialize_model_on_device(model, target_device)
+    return dispatch_model(model, device_map=device_map)
+
+
 def set_tuning_device_for_layer(model, name: str, device: str) -> None:
     """Sets the device for a module if it matches the given name."""
     module = get_module(model, name)
@@ -1316,6 +1350,9 @@ def partition_dict_numbers(number_dict, n):
 
 
 def dispatch_model_block_wise(model: torch.nn.Module, device_map: str, max_mem_ratio=0.9):
+    requested_device_map = device_map
+    if is_single_device_no_offload(requested_device_map):
+        return materialize_model_on_device(model, get_major_device(requested_device_map))
     if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
         import accelerate
 
@@ -1356,7 +1393,12 @@ def dispatch_model_block_wise(model: torch.nn.Module, device_map: str, max_mem_r
             " Please consider using more cards."
         )
 
-    model = dispatch_model(model, device_map=device_map)
+    model = dispatch_model_no_offload_aware(
+        model,
+        device_map=device_map,
+        requested_device_map=requested_device_map,
+        target_device=get_major_device(requested_device_map),
+    )
 
     return model
 
