@@ -2810,6 +2810,7 @@ class BaseCompressor(object):
                 num_elm = self._get_current_num_elm(inputs, whole_indices)
 
         index_sampler = IndexSampler(nsamples, global_batch_size)
+        best_params = {}
 
         for i in range(self.iters):
             total_loss = 0
