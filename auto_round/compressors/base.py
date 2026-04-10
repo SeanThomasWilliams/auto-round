@@ -672,6 +672,21 @@ class BaseCompressor(object):
         else:
             raise TypeError(f"device_map should be [str, torch.device, int, dict], but got {type(device_map)}")
 
+    def _is_single_device_no_offload(self) -> bool:
+        if not envs.AR_DISABLE_OFFLOAD:
+            return False
+        devices = parse_available_devices(self.device_map)
+        return len(devices) == 1 and all(str(device) != "cpu" for device in devices)
+
+    def _materialize_model_on_device(self, model: Optional[torch.nn.Module] = None) -> torch.nn.Module:
+        model = self.model if model is None else model
+        if hasattr(model, "hf_device_map"):
+            accelerate.hooks.remove_hook_from_submodules(model)
+        model = model.to(self.device)
+        if hasattr(model, "hf_device_map"):
+            model.hf_device_map = {"": self.device}
+        return model
+
     def _reconcile_bits_and_dtype(self, config: dict, prefix: str = ""):
         """
         Harmonizes 'bits' and 'data_type' for weights or activations.
@@ -1166,7 +1181,11 @@ class BaseCompressor(object):
 
         # Dispatch multi-GPU model if necessary
         if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
-            dispatch_model(model, model.hf_device_map)
+            if self._is_single_device_no_offload():
+                model = self._materialize_model_on_device(model)
+            else:
+                model = dispatch_model(model, model.hf_device_map)
+            self.model = model
 
         def register_act_hook(model):
             """Registers hooks to accumulate activation squared norms into `imatrix`."""
@@ -1979,7 +1998,10 @@ class BaseCompressor(object):
             enable_quanted_input = False
 
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1 and enable_quanted_input:
-            dispatch_model(self.model, self.model.hf_device_map)
+            if self._is_single_device_no_offload():
+                self.model = self._materialize_model_on_device()
+            else:
+                self.model = dispatch_model(self.model, self.model.hf_device_map)
 
         if enable_quanted_input:
             logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
@@ -2274,11 +2296,17 @@ class BaseCompressor(object):
                 if any(p.device.type == "meta" for p in self.model.parameters()):
                     materialize_model_(self.model)
 
+                no_offload_single_device = self._is_single_device_no_offload()
                 if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-                    self.model = dispatch_model(self.model, device_map=self.model.hf_device_map)
+                    if no_offload_single_device:
+                        self.model = self._materialize_model_on_device()
+                    else:
+                        self.model = dispatch_model(self.model, device_map=self.model.hf_device_map)
                 else:
                     # Change this if new device is supported
-                    if str(self.model.device) == "cpu" and (not self.device.startswith("hpu")):
+                    if no_offload_single_device:
+                        self.model = self._materialize_model_on_device()
+                    elif str(self.model.device) == "cpu" and (not self.device.startswith("hpu")):
                         # type(self.model._no_split_modules) changes from list to set when transformers > 5.0
                         no_split_modules = list(getattr(self.model, "_no_split_modules", []))
                         devices = parse_available_devices(self.device_map)
