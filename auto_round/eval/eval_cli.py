@@ -22,6 +22,7 @@ from transformers.utils.versions import require_version
 from auto_round.utils import (
     DEVICE_ENVIRON_VARIABLE_MAPPING,
     detect_device,
+    dispatch_model_no_offload_aware,
     dispatch_model_block_wise,
     get_device_and_parallelism,
     get_model_dtype,
@@ -361,7 +362,7 @@ def eval_task_by_task(
         from accelerate import dispatch_model, infer_auto_device_map
 
         device_map = infer_auto_device_map(model)
-        model = dispatch_model(model, device_map=device_map)
+        model = dispatch_model_no_offload_aware(model, device_map=device_map, requested_device_map="auto")
         parallelism = False
         is_gguf_file = False
         gguf_file = None
