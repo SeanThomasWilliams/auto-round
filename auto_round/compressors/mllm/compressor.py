@@ -41,6 +41,7 @@ from auto_round.utils import (
     find_matching_blocks,
     get_block_names,
     get_max_vram,
+    get_uma_available_memory,
     mllm_load_model,
     mv_module_from_gpu,
     to_device,
@@ -74,7 +75,7 @@ def _only_text_test(model, tokenizer, device, model_type):
         if dev_idx_str.isdigit():
             dev_idx = int(dev_idx_str)
             if 0 <= dev_idx < torch.cuda.device_count():
-                free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
+                free_bytes = get_uma_available_memory(dev_idx)
                 if model_bytes > free_bytes * 0.9:
                     use_gpu = False
 

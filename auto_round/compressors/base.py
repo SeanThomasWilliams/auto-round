@@ -26,7 +26,7 @@ from typing import Any, Callable, Optional, Union
 import accelerate
 import torch
 from accelerate.big_modeling import dispatch_model, infer_auto_device_map
-from accelerate.utils import get_balanced_memory, get_max_memory
+from accelerate.utils import get_balanced_memory
 from packaging import version
 from torch import autocast
 from tqdm import tqdm
@@ -112,6 +112,9 @@ from auto_round.utils import (
 from auto_round.utils.device import (
     clear_memory_if_reached_threshold,
     get_major_device,
+    get_max_memory_with_uma_correction,
+    is_single_device_no_offload,
+    materialize_model_on_device,
     parse_available_devices,
     set_auto_device_map_for_block_with_tuning,
     set_non_auto_device_map,
@@ -2283,7 +2286,7 @@ class BaseCompressor(object):
                         no_split_modules = list(getattr(self.model, "_no_split_modules", []))
                         devices = parse_available_devices(self.device_map)
 
-                        max_memory = get_max_memory()
+                        max_memory = get_max_memory_with_uma_correction()
                         new_max_memory = {}
                         if "cpu" not in devices:
                             devices.append("cpu")
