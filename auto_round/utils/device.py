@@ -15,6 +15,7 @@ import ctypes
 import functools
 import gc
 import os
+import platform
 import re
 import shutil
 import sys
@@ -29,7 +30,7 @@ import cpuinfo
 import psutil
 import torch
 from accelerate import dispatch_model, infer_auto_device_map
-from accelerate.utils import get_balanced_memory, get_max_memory
+from accelerate.utils import get_balanced_memory, get_max_memory as accelerate_get_max_memory
 
 from auto_round import envs
 from auto_round.logger import logger
@@ -505,6 +506,51 @@ def bytes_to_gigabytes(bytes) -> int:
     return bytes / 1024 / 1024 / 1024
 
 
+@lru_cache(maxsize=None)
+def is_integrated_gpu(device_index: int = 0) -> bool:
+    if not torch.cuda.is_available():
+        return False
+
+    if platform.machine().lower() != "aarch64":
+        return False
+
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+    except Exception:
+        return False
+
+    name = getattr(props, "name", "").lower()
+    major = getattr(props, "major", None)
+    minor = getattr(props, "minor", None)
+
+    if any(marker in name for marker in ("jetson", "orin", "tegra", "grace", "gh200", "gb10")):
+        return True
+
+    if (major, minor) in {(7, 2), (8, 7)}:
+        return True
+
+    if major == 9:
+        return True
+
+    return "nvidia" in name
+
+
+def get_uma_available_memory(device_index: int = 0) -> int:
+    free_bytes, _ = torch.cuda.mem_get_info(device_index)
+    if is_integrated_gpu(device_index):
+        return int(psutil.virtual_memory().available)
+    return int(free_bytes)
+
+
+def get_max_memory_with_uma_correction() -> dict:
+    max_memory = accelerate_get_max_memory()
+    if torch.cuda.is_available():
+        for device_index in range(torch.cuda.device_count()):
+            if device_index in max_memory:
+                max_memory[device_index] = get_uma_available_memory(device_index)
+    return max_memory
+
+
 def _clear_memory_for_cpu_and_cuda(
     tensor: torch.Tensor | list[torch.Tensor] | None = None,
     device_list: tuple | list | str | torch.device | None = None,
@@ -642,8 +688,12 @@ def clear_memory_if_reached_threshold(threshold=0.85, device_list=None):
     for i in range(num_devices):
         try:
             total_memory = device_api.get_device_properties(i).total_memory
-            reserved_memory = device_api.memory_reserved(i)
-            memory_usage_ratio = reserved_memory / total_memory
+            if name == "cuda":
+                free_memory = min(get_uma_available_memory(i), total_memory)
+                used_memory = max(0, total_memory - free_memory)
+            else:
+                used_memory = device_api.memory_reserved(i)
+            memory_usage_ratio = used_memory / total_memory
 
             if memory_usage_ratio >= threshold:
                 logger.warning_once(
@@ -679,9 +729,7 @@ def check_memory_availability(device, inputs, weight, org_seqlen, org_bs):
     weight_memory = weight.numel() * weight.element_size()
     if "cuda" in device:
         current_gpu_index = torch.cuda.current_device()
-        total_memory = torch.cuda.get_device_properties(current_gpu_index).total_memory
-        used_memory = torch.cuda.memory_allocated(current_gpu_index)
-        free_space = total_memory - used_memory
+        free_space = get_uma_available_memory(current_gpu_index)
     elif "hpu" in device:  # pragma: no cover
         current_hpu_index = torch.hpu.current_device()
         total_memory = torch.hpu.memory_cached(current_hpu_index)
@@ -755,7 +803,8 @@ def get_device_memory(i: int = 0) -> int:
         int: Available memory in gigabytes.
     """
     if torch.cuda.is_available():
-        total_memory = bytes_to_gigabytes(torch.cuda.get_device_properties(i).total_memory)
+        available_memory = min(get_uma_available_memory(i), torch.cuda.get_device_properties(i).total_memory)
+        total_memory = bytes_to_gigabytes(available_memory)
     elif torch.xpu.is_available():
         total_memory = bytes_to_gigabytes(torch.xpu.get_device_properties(i).total_memory)
     else:
@@ -1366,7 +1415,7 @@ def dispatch_model_block_wise(model: torch.nn.Module, device_map: str, max_mem_r
         model.to(devices[0])
         return model
 
-    max_memory = get_max_memory()
+    max_memory = get_max_memory_with_uma_correction()
     new_max_memory = {}
     if "cpu" not in devices:
         devices.append("cpu")
@@ -1592,7 +1641,12 @@ def is_gaudi2():
 
 
 class MemoryMonitor:
-    """Global memory monitor for tracking peak RAM and VRAM usage."""
+    """Global memory monitor for tracking peak process RSS and accelerator allocator usage.
+
+    `peak_ram` is the current process RSS sampled via psutil.
+    `peak_vram` is device allocator usage sampled from the active accelerator backend.
+    On UMA systems these are overlapping views of shared physical memory, not independent pools.
+    """
 
     _instance = None
     _lock = Lock()
@@ -1610,8 +1664,8 @@ class MemoryMonitor:
         if self._initialized:
             return
         self._initialized = True
-        self.peak_ram = 0.0  # GB
-        self.peak_vram = {}  # {device_id: peak_mb}
+        self.peak_ram = 0.0  # GB of process RSS via psutil.Process().memory_info().rss
+        self.peak_vram = {}  # {device_id: peak_gb} from accelerator allocator usage
         self.enabled = True
 
     def update(self, device_list=None):
