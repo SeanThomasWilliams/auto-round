@@ -89,8 +89,24 @@ def compile_func_on_hpu(func):
     return func
 
 
+@contextmanager
+def _torch_dynamo_config_override(name: str, value: Any):
+    config = getattr(torch._dynamo, "config", None)
+    if config is None or not hasattr(config, name):
+        yield
+        return
+
+    previous_value = getattr(config, name)
+    setattr(config, name, value)
+    try:
+        yield
+    finally:
+        setattr(config, name, previous_value)
+
+
 def compile_func_on_cuda_or_cpu(func):
-    return torch.compile(func, dynamic=True)
+    with _torch_dynamo_config_override("force_parameter_static_shapes", False):
+        return torch.compile(func, dynamic=True)
 
 
 def compile_func(
