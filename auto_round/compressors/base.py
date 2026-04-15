@@ -384,6 +384,7 @@ class BaseCompressor(object):
         self.scale_dtype = convert_dtype_str2torch(scale_dtype)
         self.low_cpu_mem_usage = low_cpu_mem_usage
         self._offloader = OffloadManager(enabled=low_cpu_mem_usage, mode="offload", offload_dir_prefix="compressor")
+        self._dispatch_offloader = OffloadManager(enabled=True, mode="offload", offload_dir_prefix="accelerate_dispatch")
 
         if kwargs:
             logger.warning(f"unrecognized keys {list(kwargs.keys())} were passed. Please check them.")
@@ -681,6 +682,46 @@ class BaseCompressor(object):
     def _materialize_model_on_device(self, model: Optional[torch.nn.Module] = None) -> torch.nn.Module:
         model = self.model if model is None else model
         return materialize_model_on_device(model, self.device)
+
+    def _ensure_dispatch_offload_dir(self) -> str:
+        return self._dispatch_offloader.get_offload_dir()
+
+    def _get_dispatch_offload_dir(self, device_map) -> Optional[str]:
+        if not isinstance(device_map, dict) or "disk" not in device_map.values():
+            return None
+        return self._ensure_dispatch_offload_dir()
+
+    def _dispatch_model_with_offload_support(
+        self,
+        model: Optional[torch.nn.Module] = None,
+        device_map=None,
+    ) -> torch.nn.Module:
+        model = self.model if model is None else model
+        device_map = getattr(model, "hf_device_map", None) if device_map is None else device_map
+        offload_dir = self._get_dispatch_offload_dir(device_map)
+        try:
+            return dispatch_model_no_offload_aware(
+                model,
+                device_map=device_map,
+                requested_device_map=self.device_map,
+                target_device=self.device,
+                offload_dir=offload_dir,
+            )
+        except ValueError as e:
+            if "offload_dir" not in str(e):
+                raise
+            offload_dir = self._ensure_dispatch_offload_dir()
+            logger.warning(
+                "Due to insufficient resources, disk is used to store the model. "
+                f"`offload_dir={offload_dir}`"
+            )
+            return dispatch_model_no_offload_aware(
+                model,
+                device_map=device_map,
+                requested_device_map=self.device_map,
+                target_device=self.device,
+                offload_dir=offload_dir,
+            )
 
     def _reconcile_bits_and_dtype(self, config: dict, prefix: str = ""):
         """
@@ -1179,12 +1220,7 @@ class BaseCompressor(object):
             if self._is_single_device_no_offload():
                 model = self._materialize_model_on_device(model)
             else:
-                model = dispatch_model_no_offload_aware(
-                    model,
-                    model.hf_device_map,
-                    requested_device_map=self.device_map,
-                    target_device=self.device,
-                )
+                model = self._dispatch_model_with_offload_support(model=model, device_map=model.hf_device_map)
             self.model = model
 
         def register_act_hook(model):
@@ -2005,12 +2041,7 @@ class BaseCompressor(object):
             if self._is_single_device_no_offload():
                 self.model = self._materialize_model_on_device()
             else:
-                self.model = dispatch_model_no_offload_aware(
-                    self.model,
-                    self.model.hf_device_map,
-                    requested_device_map=self.device_map,
-                    target_device=self.device,
-                )
+                self.model = self._dispatch_model_with_offload_support(device_map=self.model.hf_device_map)
 
         if enable_quanted_input:
             logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
@@ -2313,12 +2344,7 @@ class BaseCompressor(object):
                     if no_offload_single_device:
                         self.model = self._materialize_model_on_device()
                     else:
-                        self.model = dispatch_model_no_offload_aware(
-                            self.model,
-                            device_map=self.model.hf_device_map,
-                            requested_device_map=self.device_map,
-                            target_device=self.device,
-                        )
+                        self.model = self._dispatch_model_with_offload_support(device_map=self.model.hf_device_map)
                 else:
                     # Change this if new device is supported
                     if no_offload_single_device:
@@ -2375,28 +2401,7 @@ class BaseCompressor(object):
                                 " Please consider using more cards."
                             )
 
-                        try:
-
-                            self.model = dispatch_model_no_offload_aware(
-                                self.model,
-                                device_map=device_map,
-                                requested_device_map=self.device_map,
-                                target_device=self.device,
-                            )
-                        except ValueError as e:
-                            if "offload_dir" in e.__str__():
-                                logger.warning(
-                                    f"Due to insufficient resources, disk is used to store the model."
-                                    f" `offload_dir={envs.AR_WORK_SPACE}`"
-                                )
-                                self.model = dispatch_model_no_offload_aware(
-                                    self.model,
-                                    device_map=device_map,
-                                    requested_device_map=self.device_map,
-                                    target_device=self.device,
-                                )
-                            else:
-                                raise
+                        self.model = self._dispatch_model_with_offload_support(device_map=device_map)
                     else:
 
                         self.model = self.model.to(self.device)

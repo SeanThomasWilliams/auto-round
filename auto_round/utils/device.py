@@ -818,13 +818,16 @@ def dispatch_model_no_offload_aware(
     device_map,
     requested_device_map=None,
     target_device: Optional[Union[str, torch.device, int]] = None,
+    offload_dir: Optional[str] = None,
 ):
     requested_device_map = device_map if requested_device_map is None else requested_device_map
     if is_single_device_no_offload(requested_device_map):
         if target_device is None:
             target_device = get_major_device(requested_device_map)
         return materialize_model_on_device(model, target_device)
-    return dispatch_model(model, device_map=device_map)
+    if offload_dir is None:
+        return dispatch_model(model, device_map=device_map)
+    return dispatch_model(model, device_map=device_map, offload_dir=offload_dir)
 
 
 def set_tuning_device_for_layer(model, name: str, device: str) -> None:

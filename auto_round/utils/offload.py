@@ -334,6 +334,9 @@ class OffloadManager:
             device_list=device_list,
         )
 
+    def get_offload_dir(self) -> str:
+        return self._ensure_dir()
+
     # ------------------------------------------------------------------
     # Core API
     # ------------------------------------------------------------------
