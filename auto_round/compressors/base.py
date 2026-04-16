@@ -113,8 +113,6 @@ from auto_round.utils.device import (
     clear_memory_if_reached_threshold,
     get_major_device,
     get_max_memory_with_uma_correction,
-    is_single_device_no_offload,
-    materialize_model_on_device,
     parse_available_devices,
     set_auto_device_map_for_block_with_tuning,
     set_non_auto_device_map,
