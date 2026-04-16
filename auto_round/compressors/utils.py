@@ -472,7 +472,7 @@ def set_layer_config(
     if lm_head_name in layer_config:
         quant_lm_head = True
 
-    if quant_lm_head and tie_word_embeddings and not gguf_name:
+    if quant_lm_head and tie_word_embeddings and not is_separate_lm_head(model) and not gguf_name:
         quant_lm_head = False
         logger.warning(
             "reset `quant_lm_head` to false as quantizing " "lm_head with tied weights has not been supported currently"
