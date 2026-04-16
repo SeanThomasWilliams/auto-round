@@ -3397,6 +3397,7 @@ class BaseCompressor(object):
                 tokenizer=self.tokenizer,
                 device=self.device,
                 serialization_dict=serialization_dict,
+                rounder=self,
                 **kwargs,
             )
             folders.append(save_folder)

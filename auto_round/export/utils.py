@@ -235,6 +235,41 @@ def save_model(
         logger.warning("Skipping source model Python file copy due to error: %s", e)
 
 
+def save_config_only(model: nn.Module, save_dir: str, dtype=None, config_file="quantization_config.json"):
+    os.makedirs(save_dir, exist_ok=True)
+
+    if hasattr(model, "config") and model.config is not None:
+        model.config.save_pretrained(save_dir)
+
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.save_pretrained(save_dir)
+
+    config_path = os.path.join(save_dir, "config.json")
+    if dtype is not None and hasattr(model, "dtype") and dtype != model.dtype and os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        dtype_str = str(dtype).split(".")[-1]
+        data["torch_dtype"] = dtype_str
+        if "dtype" in data:
+            data["dtype"] = dtype_str
+        with open(config_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2)
+
+    if hasattr(model, "config") and hasattr(model.config, "quantization_config"):
+        with open(os.path.join(save_dir, config_file), "w", encoding="utf-8") as f:
+            json.dump(model.config.quantization_config, f, indent=2)
+
+    try:
+        if (
+            hasattr(model, "config")
+            and hasattr(model.config, "_name_or_path")
+            and model.config.name_or_path is not None
+        ):
+            copy_python_files_from_model_cache(model, save_dir)
+    except Exception as e:
+        logger.warning("Skipping source model Python file copy due to error: %s", e)
+
+
 def get_autogptq_packing_qlinear(backend, bits=4, group_size=128, sym=False):
     """
     Configures and returns a QuantLinear class based on the specified backend and parameters.

@@ -94,3 +94,17 @@ def test_finalize_skips_lm_head_when_tie_word_embeddings_true(tmp_path):
     assert "transformer_blocks.0.linear.weight" in saved_tensors
     assert "lm_head.weight" not in saved_tensors, "lm_head must be skipped when tied"
     assert model.lm_head.weight.device.type == "meta"
+
+
+def test_save_module_flush_writes_shard_immediately(tmp_path):
+    model = _LMStyleModel()
+    rounder = _RounderStub(model, str(tmp_path))
+    writer = ShardWriter(rounder)
+
+    writer.save_module(model.transformer_blocks[0], "transformer_blocks.0", flush=True)
+
+    shard_path = os.path.join(tmp_path, "model-shard-00001.bin")
+    saved_tensors = torch.load(shard_path, map_location="cpu")
+
+    assert "transformer_blocks.0.linear.weight" in saved_tensors
+    assert model.transformer_blocks[0].linear.weight.device.type == "meta"

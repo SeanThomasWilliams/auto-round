@@ -36,11 +36,13 @@ from auto_round.export.utils import (
     get_autogptq_packing_qlinear,
     release_layer_safely,
     resolve_pipeline_export_layout,
+    save_config_only,
     save_model,
 )
 from auto_round.formats import AutoRoundExportFormat
 from auto_round.logger import logger
 from auto_round.schemes import QuantizationScheme
+from auto_round.compressors.shard_writer import ShardWriter
 from auto_round.utils import (
     SUPPORTED_FORMATS,
     SUPPORTED_LAYER_TYPES,
@@ -271,6 +273,8 @@ def save_quantized_as_autoround(
 
     processor = kwargs.get("processor", None)
     image_processor = kwargs.get("image_processor", None)
+    rounder = kwargs.get("rounder")
+    incremental_shard_export = kwargs.get("incremental_shard_export", rounder is not None)
 
     extra_config = {}
     block_name_to_quantize = quantization_config["block_name_to_quantize"]
@@ -309,21 +313,38 @@ def save_quantized_as_autoround(
         quantization_config["extra_config"] = extra_config
 
     names = list(layer_config.keys())
-    max_workers = 1
-    if not torch.cuda.is_available() and not torch.xpu.is_available():
-        max_workers = 2  ## 2 with cuda packing will cause hang occasionally
-    if not unsupported_meta_device(model):
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            with tqdm(total=len(names), leave=True) as pbar:
+    if incremental_shard_export and rounder is not None and not unsupported_meta_device(model):
+        writer = getattr(rounder, "_shard_writer", None)
+        if writer is None:
+            writer = ShardWriter(rounder)
+            rounder._shard_writer = writer
+        with tqdm(total=len(names), leave=True) as pbar:
+            for name in names:
+                pbar.set_description(f"packing {name}")
+                with tctl.threadpool_limits(limits=1):
+                    pack_layer(name, model, backend, device)
+                packed_module = get_module(model, name)
+                writer.save_module(packed_module, name=name, flush=True)
+                packed_module.to("meta")
+                pbar.update(1)
+        writer.finalize()
+        del rounder._shard_writer
+    else:
+        max_workers = 1
+        if not torch.cuda.is_available() and not torch.xpu.is_available():
+            max_workers = 2  ## 2 with cuda packing will cause hang occasionally
+        if not unsupported_meta_device(model):
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                with tqdm(total=len(names), leave=True) as pbar:
 
-                def wrapper(name):
-                    pbar.set_description(f"packing {name}")
-                    with tctl.threadpool_limits(limits=1):
-                        pack_layer(name, model, backend, device)
-                    pbar.update(1)
+                    def wrapper(name):
+                        pbar.set_description(f"packing {name}")
+                        with tctl.threadpool_limits(limits=1):
+                            pack_layer(name, model, backend, device)
+                        pbar.update(1)
 
-                for _ in executor.map(wrapper, names):
-                    pass
+                    for _ in executor.map(wrapper, names):
+                        pass
     filter_quantization_config(quantization_config)
     if hasattr(model, "config"):
         model.config.quantization_config = quantization_config
@@ -353,6 +374,9 @@ def save_quantized_as_autoround(
         dtype = torch.float16  ## awq vllm kernel only supports float16 on cuda
     else:
         dtype = None
-    save_model(model, model_output_dir, safe_serialization=safe_serialization, dtype=dtype)
+    if incremental_shard_export and rounder is not None:
+        save_config_only(model, model_output_dir, dtype=dtype)
+    else:
+        save_model(model, model_output_dir, safe_serialization=safe_serialization, dtype=dtype)
 
     return model

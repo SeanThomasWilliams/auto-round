@@ -92,7 +92,7 @@ class ShardWriter:
                 logger.warning("safetensors not installed; falling back to torch.save.")
         return False
 
-    def save_module(self, m: torch.nn.Module, name: str = None):
+    def save_module(self, m: torch.nn.Module, name: str = None, flush: bool = False):
         """Extracts and accumulates tensors from a module."""
         prefix = name if name is not None else getattr(m, "global_name", "model")
         sd = m.state_dict()
@@ -102,6 +102,9 @@ class ShardWriter:
                 continue
             param_name = f"{prefix}.{k}"
             self._add_tensor(param_name, v)
+
+        if flush:
+            self.flush()
 
     def _add_tensor(self, name: str, tensor: torch.Tensor):
         if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
@@ -160,6 +163,9 @@ class ShardWriter:
 
         self.current_shard_tensors = OrderedDict()
         self.current_shard_size = 0
+
+    def flush(self):
+        self._flush_shard()
 
     def _offload_to_meta(self, saved_params):
         """Attempts to move fully saved modules to the 'meta' device to free RAM."""
@@ -251,7 +257,7 @@ class ShardWriter:
 
 
 @torch.no_grad()
-def shard_writer(rounder: object, m: torch.nn.Module = None, name: str = None, is_finalize: bool = False):
+def shard_writer(rounder: object, m: torch.nn.Module = None, name: str = None, flush: bool = False, is_finalize: bool = False):
     if m is None and name is None and not is_finalize and not is_finalize:
         raise ValueError("Must specify either name or m")
     if not hasattr(rounder, "_shard_writer"):
@@ -261,7 +267,7 @@ def shard_writer(rounder: object, m: torch.nn.Module = None, name: str = None, i
         m = get_module(rounder.model, name)
         # Perform the save
     if m is not None:
-        rounder._shard_writer.save_module(m, name)
+        rounder._shard_writer.save_module(m, name, flush=flush)
 
     if is_finalize:
         rounder._shard_writer.finalize()
