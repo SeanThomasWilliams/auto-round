@@ -1315,7 +1315,7 @@ class BaseCompressor(object):
         if self.is_immediate_saving:
             m = get_module(self.model, name)
             m.to("cpu")
-            shard_writer(self, m, name, False)
+            shard_writer(self, m, name, flush=True, is_finalize=False)
             # Free RAM immediately: the data is now in the shard-writer buffer
             # (and will be flushed to disk).  Keeping it also in the model tree
             # causes linear RAM growth for large models.
@@ -1442,7 +1442,7 @@ class BaseCompressor(object):
                             ):
                                 set_module(self.model, m.global_name, copy.deepcopy(m))
                                 if self.is_immediate_saving:
-                                    shard_writer(self, name=m.global_name)
+                                    shard_writer(self, name=m.global_name, flush=True)
                                     copied_m = get_module(self.model, m.global_name)
                                     copied_m.to("meta")
                                 m.to("meta")
@@ -1453,7 +1453,7 @@ class BaseCompressor(object):
                         else:
                             # Save once at block scope to capture tensors that are not saved
                             # in per-layer branch (e.g., custom module-level params/buffers).
-                            shard_writer(self, name=block_name)
+                            shard_writer(self, name=block_name, flush=True)
                             block.to("meta")
                         if self.low_cpu_mem_usage and not self.is_immediate_saving:
                             self._offloader(self.model, block_name)
@@ -1493,7 +1493,7 @@ class BaseCompressor(object):
                         and self.is_immediate_saving
                     ):
                         set_module(self.model, n, copy.deepcopy(m))
-                        shard_writer(self, name=n)
+                        shard_writer(self, name=n, flush=True)
                         m.to("meta")
 
         # Convert remaining fp8
@@ -1964,7 +1964,15 @@ class BaseCompressor(object):
                 )
                 new_layer = wrapper_layer.unwrapper({})
                 set_module(self.model, layer_name, new_layer)
-                layer.cpu()
+                if self.is_immediate_packing:
+                    self._immediate_pack(layer_name)
+                if self.is_immediate_saving:
+                    m = get_module(self.model, layer_name)
+                    m.to("cpu")
+                    shard_writer(self, m, name=layer_name, flush=True, is_finalize=False)
+                    m.to("meta")
+                else:
+                    layer.cpu()
                 layer_names.remove(layer_name)
         if len(layer_names) == 0:
             memory_monitor.update()
@@ -2004,7 +2012,7 @@ class BaseCompressor(object):
 
             if self.is_immediate_saving:
                 m = get_module(self.model, layer_name)
-                shard_writer(self, m, name=layer_name, is_finalize=False)
+                shard_writer(self, m, name=layer_name, flush=True, is_finalize=False)
             del layer_input
             clear_memory(q_layer_input, device_list=self.device_list)
             memory_monitor.log_summary()
@@ -3319,7 +3327,7 @@ class BaseCompressor(object):
                     self._immediate_pack(tmp_m.global_name)
 
             if self.is_immediate_saving:
-                shard_writer(self, m, is_finalize=False)
+                shard_writer(self, m, flush=True, is_finalize=False)
 
             if self.low_cpu_mem_usage and not self.is_immediate_saving:
                 if nblocks == 1:
