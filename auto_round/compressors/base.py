@@ -14,6 +14,7 @@
 
 import copy
 import os
+import psutil
 import sys
 import time
 import traceback
@@ -25,7 +26,7 @@ from typing import Any, Callable, Optional, Union
 
 import accelerate
 import torch
-from accelerate.big_modeling import dispatch_model, infer_auto_device_map
+from accelerate.big_modeling import infer_auto_device_map
 from accelerate.utils import get_balanced_memory
 from packaging import version
 from torch import autocast
@@ -116,8 +117,7 @@ from auto_round.utils.device import (
     dispatch_model_no_offload_aware,
     get_major_device,
     get_max_memory_with_uma_correction,
-    is_single_device_no_offload,
-    materialize_model_on_device,
+    log_inferred_device_map,
     parse_available_devices,
     set_auto_device_map_for_block_with_tuning,
     set_non_auto_device_map,
@@ -674,12 +674,23 @@ class BaseCompressor(object):
         else:
             raise TypeError(f"device_map should be [str, torch.device, int, dict], but got {type(device_map)}")
 
-    def _is_single_device_no_offload(self) -> bool:
-        return is_single_device_no_offload(self.device_map)
+    @staticmethod
+    def _current_rss_gb() -> float:
+        return psutil.Process().memory_info().rss / 1e9
 
-    def _materialize_model_on_device(self, model: Optional[torch.nn.Module] = None) -> torch.nn.Module:
-        model = self.model if model is None else model
-        return materialize_model_on_device(model, self.device)
+    @staticmethod
+    def _current_vram_gb() -> float:
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            return torch.cuda.memory_allocated() / 1e9
+        except Exception:
+            return 0.0
+
+    def _log_packing_state(self, phase: str, name: str) -> None:
+        logger.trace(
+            f"{phase} name={name} rss_gb={self._current_rss_gb():.2f} vram_gb={self._current_vram_gb():.2f}"
+        )
 
     def _reconcile_bits_and_dtype(self, config: dict, prefix: str = ""):
         """
@@ -1175,15 +1186,12 @@ class BaseCompressor(object):
 
         # Dispatch multi-GPU model if necessary
         if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
-            if self._is_single_device_no_offload():
-                model = self._materialize_model_on_device(model)
-            else:
-                model = dispatch_model_no_offload_aware(
-                    model,
-                    model.hf_device_map,
-                    requested_device_map=self.device_map,
-                    target_device=self.device,
-                )
+            model = dispatch_model_no_offload_aware(
+                model,
+                model.hf_device_map,
+                requested_device_map=self.device_map,
+                target_device=self.device,
+            )
             self.model = model
 
         def register_act_hook(model):
@@ -1341,14 +1349,18 @@ class BaseCompressor(object):
     def _immediate_pack(self, name: str):
         if not self.is_immediate_packing:
             return
-        self.formats[0].immediate_pack(
-            name=name,
-            model=self.model,
-            device=self.device,
-            output_dir=self._get_save_folder_name(self.formats[0]),
-            layer_config=self.layer_config,
-            tokenizer=self.tokenizer,
-        )
+        self._log_packing_state("packing.start", name)
+        try:
+            self.formats[0].immediate_pack(
+                name=name,
+                model=self.model,
+                device=self.device,
+                output_dir=self._get_save_folder_name(self.formats[0]),
+                layer_config=self.layer_config,
+                tokenizer=self.tokenizer,
+            )
+        finally:
+            self._log_packing_state("packing.end", name)
 
     # Use no_grad instead of inference mode
     # https://github.com/intel/auto-round/issues/1620
@@ -1850,14 +1862,8 @@ class BaseCompressor(object):
             all_q_inputs = self.try_cache_inter_data_gpucpu(
                 all_first_block_names, self.nsamples, layer_names=layer_names
             )
-        # Remove accelerate dispatch hooks before moving parameters.
-        # In single-device UMA mode, reset hf_device_map now so stale CPU entries
-        # cannot be reused by later layer-cache redispatch paths.
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-            if self._is_single_device_no_offload():
-                self.model = self._materialize_model_on_device()
-            else:
-                accelerate.hooks.remove_hook_from_submodules(self.model)
+            accelerate.hooks.remove_hook_from_submodules(self.model)
         self.model = mv_module_from_gpu(self.model)
         clear_memory(device_list=self.device_list)
         logger.info("caching done")
@@ -2007,26 +2013,20 @@ class BaseCompressor(object):
             enable_quanted_input = False
 
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1 and enable_quanted_input:
-            if self._is_single_device_no_offload():
-                self.model = self._materialize_model_on_device()
-            else:
-                self.model = dispatch_model_no_offload_aware(
-                    self.model,
-                    self.model.hf_device_map,
-                    requested_device_map=self.device_map,
-                    target_device=self.device,
-                )
+            self.model = dispatch_model_no_offload_aware(
+                self.model,
+                self.model.hf_device_map,
+                requested_device_map=self.device_map,
+                target_device=self.device,
+            )
 
         if enable_quanted_input:
             logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
             q_layer_inputs = self.try_cache_inter_data_gpucpu([], self.nsamples, layer_names=layer_names)
             if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-                if self._is_single_device_no_offload():
-                    self.model = self._materialize_model_on_device()
-                else:
-                    accelerate.hooks.remove_hook_from_submodules(
-                        self.model
-                    )  # self.model.hf_device_map has not been changed
+                accelerate.hooks.remove_hook_from_submodules(
+                    self.model
+                )  # self.model.hf_device_map has not been changed
         if not self.is_immediate_saving:
             self.model = mv_module_from_gpu(self.model)
         clear_memory(device_list=self.device_list)
@@ -2334,22 +2334,16 @@ class BaseCompressor(object):
                 if any(p.device.type == "meta" for p in self.model.parameters()):
                     materialize_model_(self.model)
 
-                no_offload_single_device = self._is_single_device_no_offload()
                 if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-                    if no_offload_single_device:
-                        self.model = self._materialize_model_on_device()
-                    else:
-                        self.model = dispatch_model_no_offload_aware(
-                            self.model,
-                            device_map=self.model.hf_device_map,
-                            requested_device_map=self.device_map,
-                            target_device=self.device,
-                        )
+                    self.model = dispatch_model_no_offload_aware(
+                        self.model,
+                        device_map=self.model.hf_device_map,
+                        requested_device_map=self.device_map,
+                        target_device=self.device,
+                    )
                 else:
                     # Change this if new device is supported
-                    if no_offload_single_device:
-                        self.model = self._materialize_model_on_device()
-                    elif str(self.model.device) == "cpu" and (not self.device.startswith("hpu")):
+                    if str(self.model.device) == "cpu" and (not self.device.startswith("hpu")):
                         # type(self.model._no_split_modules) changes from list to set when transformers > 5.0
                         no_split_modules = list(getattr(self.model, "_no_split_modules", []))
                         devices = parse_available_devices(self.device_map)
@@ -2396,6 +2390,11 @@ class BaseCompressor(object):
                             self.model.tie_weights()
                         device_map = infer_auto_device_map(
                             self.model, max_memory=new_max_memory, no_split_module_classes=no_split_modules
+                        )
+                        log_inferred_device_map(
+                            "BaseCompressor.try_cache_inter_data_gpucpu",
+                            requested_device_map=self.device_map,
+                            device_map=device_map,
                         )
                         if len(devices) > 1 and "cpu" in device_map.values():
                             logger.warning(
