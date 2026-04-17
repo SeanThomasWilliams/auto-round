@@ -32,6 +32,7 @@ import torch
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory, get_max_memory as accelerate_get_max_memory
 
+from auto_round import envs
 from auto_round.logger import logger
 from auto_round.utils.model import check_to_quantized, get_block_names, get_layer_features, get_module
 
