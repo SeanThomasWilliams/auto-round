@@ -37,7 +37,6 @@ from auto_round.data_type.gguf import (
     search_gguf_scale_min_asym,
     search_gguf_scale_min_sym,
 )
-from auto_round.utils import dispatch_model_no_offload_aware
 from auto_round.data_type.utils import reshape_pad_tensor_by_group_size, revert_tensor_by_pad
 from auto_round.logger import logger
 from auto_round.schemes import QuantizationScheme, preset_name_to_scheme
@@ -979,12 +978,7 @@ def gen_layer_config(
     major_device = get_major_device(device_map)
     if not low_gpu_mem_usage:
         if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
-            model = dispatch_model_no_offload_aware(
-                model,
-                device_map=model.hf_device_map,
-                requested_device_map=device_map,
-                target_device=major_device,
-            )
+            model = dispatch_model(model, device_map=model.hf_device_map)
         else:
             model = dispatch_model_by_all_available_devices(model, device_map)
     else:

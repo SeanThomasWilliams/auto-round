@@ -523,15 +523,19 @@ class MLLMCompressor(BaseCompressor):
     def _immediate_pack(self, name: str):
         if not self.is_immediate_packing:  # pylint: disable=E1101
             return
-        self.formats[0].immediate_pack(
-            name=name,
-            model=self.model,
-            device=self.device,
-            output_dir=self._get_save_folder_name(self.formats[0]),
-            mllm=self.mllm,
-            layer_config=self.layer_config,
-            tokenizer=self.tokenizer,
-            processor=self.processor if hasattr(self, "processor") else None,
-            image_processor=self.image_processor if hasattr(self, "image_processor") else None,
-            quant_nontext_module=self.quant_nontext_module if hasattr(self, "quant_nontext_module") else False,
-        )
+        self._log_packing_state("packing.start", name)
+        try:
+            self.formats[0].immediate_pack(
+                name=name,
+                model=self.model,
+                device=self.device,
+                output_dir=self._get_save_folder_name(self.formats[0]),
+                mllm=self.mllm,
+                layer_config=self.layer_config,
+                tokenizer=self.tokenizer,
+                processor=self.processor if hasattr(self, "processor") else None,
+                image_processor=self.image_processor if hasattr(self, "image_processor") else None,
+                quant_nontext_module=self.quant_nontext_module if hasattr(self, "quant_nontext_module") else False,
+            )
+        finally:
+            self._log_packing_state("packing.end", name)

@@ -1862,6 +1862,8 @@ class BaseCompressor(object):
             all_q_inputs = self.try_cache_inter_data_gpucpu(
                 all_first_block_names, self.nsamples, layer_names=layer_names
             )
+        # Remove accelerate dispatch hooks before moving parameters.
+        # hf_device_map is kept for reference but hooks are no longer needed.
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
             accelerate.hooks.remove_hook_from_submodules(self.model)
         self.model = mv_module_from_gpu(self.model)
@@ -2403,12 +2405,7 @@ class BaseCompressor(object):
                             )
 
                         try:
-                            self.model = dispatch_model_no_offload_aware(
-                                self.model,
-                                device_map=device_map,
-                                requested_device_map=self.device_map,
-                                target_device=self.device,
-                            )
+                            self.model = dispatch_model(self.model, device_map=device_map)
                             if has_ngram_embeddings:
                                 self.model.model.ngram_embeddings = raw_ngram_embeddings
                         except ValueError as e:
@@ -2417,11 +2414,8 @@ class BaseCompressor(object):
                                     f"Due to insufficient resources, disk is used to store the model."
                                     f" `offload_dir={envs.AR_WORK_SPACE}`"
                                 )
-                                self.model = dispatch_model_no_offload_aware(
-                                    self.model,
-                                    device_map=device_map,
-                                    requested_device_map=self.device_map,
-                                    target_device=self.device,
+                                self.model = dispatch_model(
+                                    self.model, device_map=device_map, offload_dir=envs.AR_WORK_SPACE
                                 )
                             else:
                                 raise

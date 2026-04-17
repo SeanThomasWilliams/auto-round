@@ -32,7 +32,6 @@ import torch
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory, get_max_memory as accelerate_get_max_memory
 
-from auto_round import envs
 from auto_round.logger import logger
 from auto_round.utils.model import check_to_quantized, get_block_names, get_layer_features, get_module
 
@@ -850,23 +849,39 @@ def get_major_device(device_map: Union[None, str, torch.device, int, dict]) -> s
     return "cpu"
 
 
-def is_single_device_no_offload(device_map: Union[None, str, torch.device, int, dict]) -> bool:
-    if not envs.AR_DISABLE_OFFLOAD:
-        return False
-    devices = parse_available_devices(device_map)
-    return len(devices) == 1 and all(not str(device).startswith("cpu") for device in devices)
+def _device_map_values(device_map: Union[None, str, torch.device, int, dict]) -> list[str]:
+    if isinstance(device_map, dict):
+        return [str(value) for value in device_map.values()]
+    if device_map is None:
+        return []
+    return [str(device_map)]
 
 
-def materialize_model_on_device(model: torch.nn.Module, device: Union[str, torch.device, int]) -> torch.nn.Module:
-    target_device = detect_device(device)
-    if hasattr(model, "hf_device_map"):
-        import accelerate
+def _workspace_state(path: str) -> tuple[bool, bool, int]:
+    if not os.path.exists(path):
+        return False, True, 0
+    if not os.path.isdir(path):
+        return True, False, 1
+    try:
+        entry_count = len(os.listdir(path))
+    except OSError:
+        entry_count = -1
+    return True, entry_count == 0, entry_count
 
-        accelerate.hooks.remove_hook_from_submodules(model)
-    model = model.to(target_device)
-    if hasattr(model, "hf_device_map"):
-        model.hf_device_map = {"": target_device}
-    return model
+
+def log_inferred_device_map(source: str, requested_device_map, device_map) -> None:
+    resolved_values = _device_map_values(device_map)
+    has_disk = any(value == "disk" for value in resolved_values)
+    has_cpu = any(value == "cpu" for value in resolved_values)
+    logger.trace(
+        f"infer_auto_device_map source={source} requested={requested_device_map} "
+        f"resolved_devices={resolved_values} has_disk={has_disk} has_cpu={has_cpu}"
+    )
+    if not has_disk:
+        logger.warning(
+            f"{source}: infer_auto_device_map returned no disk entries for requested_device_map={requested_device_map}; "
+            f"resolved_devices={resolved_values}"
+        )
 
 
 def dispatch_model_no_offload_aware(
@@ -875,11 +890,24 @@ def dispatch_model_no_offload_aware(
     requested_device_map=None,
     target_device: Optional[Union[str, torch.device, int]] = None,
 ):
+    del target_device
     requested_device_map = device_map if requested_device_map is None else requested_device_map
-    if is_single_device_no_offload(requested_device_map):
-        if target_device is None:
-            target_device = get_major_device(requested_device_map)
-        return materialize_model_on_device(model, target_device)
+    resolved_values = _device_map_values(device_map)
+    uses_disk = any(value == "disk" for value in resolved_values)
+    if uses_disk:
+        workspace = os.path.abspath(envs.AR_WORK_SPACE)
+        exists, empty, entry_count = _workspace_state(workspace)
+        os.makedirs(workspace, exist_ok=True)
+        logger.trace(
+            f"dispatch.offload_workspace requested={requested_device_map} path={workspace} "
+            f"exists={exists} empty={empty} entries={entry_count} skip_non_empty=false"
+        )
+        return dispatch_model(model, device_map=device_map, offload_dir=workspace)
+    if any(value == "cpu" for value in resolved_values):
+        logger.trace(
+            f"dispatch.cpu_fallback requested={requested_device_map} resolved_devices={resolved_values} "
+            f"offload_workspace={os.path.abspath(envs.AR_WORK_SPACE)}"
+        )
     return dispatch_model(model, device_map=device_map)
 
 
@@ -1406,9 +1434,6 @@ def partition_dict_numbers(number_dict, n):
 
 
 def dispatch_model_block_wise(model: torch.nn.Module, device_map: str, max_mem_ratio=0.9):
-    requested_device_map = device_map
-    if is_single_device_no_offload(requested_device_map):
-        return materialize_model_on_device(model, get_major_device(requested_device_map))
     if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
         import accelerate
 
@@ -1443,6 +1468,7 @@ def dispatch_model_block_wise(model: torch.nn.Module, device_map: str, max_mem_r
     )
     model.tie_weights()
     device_map = infer_auto_device_map(model, max_memory=new_max_memory, no_split_module_classes=no_split_modules)
+    log_inferred_device_map("dispatch_model_block_wise", requested_device_map, device_map)
     if len(devices) > 1 and "cpu" in device_map.values():
         logger.warning(
             "Some layers are offloaded to cpu, which may severely impact calibration speed."
@@ -1453,7 +1479,6 @@ def dispatch_model_block_wise(model: torch.nn.Module, device_map: str, max_mem_r
         model,
         device_map=device_map,
         requested_device_map=requested_device_map,
-        target_device=get_major_device(requested_device_map),
     )
 
     return model
@@ -1902,7 +1927,8 @@ def dispatch_model_by_all_available_devices(
             no_split_module_classes=no_split_modules,
         )
         device_map = infer_auto_device_map(model, max_memory=max_memory, no_split_module_classes=no_split_modules)
-        model = dispatch_model(model, device_map=device_map)
+        log_inferred_device_map("to_device_or_dispatch.auto", "auto", device_map)
+        model = dispatch_model_no_offload_aware(model, device_map=device_map, requested_device_map="auto")
         return model
 
     devices = parse_available_devices(device_map)
@@ -1933,5 +1959,6 @@ def dispatch_model_by_all_available_devices(
     if hasattr(model, "tie_weights") and callable(model.tie_weights):
         model.tie_weights()
     device_map = infer_auto_device_map(model, max_memory=new_max_memory, no_split_module_classes=no_split_modules)
-    model = dispatch_model(model, device_map=device_map)
+    log_inferred_device_map("to_device_or_dispatch.filtered", device_map, device_map)
+    model = dispatch_model_no_offload_aware(model, device_map=device_map, requested_device_map=device_map)
     return model

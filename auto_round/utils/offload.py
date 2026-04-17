@@ -280,6 +280,8 @@ class OffloadManager:
         self.model_dir = model_dir
         self.cache_numel = cache_numel
         self._prefix = offload_dir_prefix
+        self._disabled_reason = "disabled_by_env" if enabled and envs.AR_DISABLE_OFFLOAD else "disabled_by_config"
+        self._engaged = False
 
         # Disk state (offload mode)
         self._tempdir: Optional[str] = None
@@ -296,6 +298,43 @@ class OffloadManager:
 
         # Ensure-style state (for wrapping loops)
         self._current_loaded: Optional[str] = None
+
+        logger.trace(
+            f"OffloadManager.init mode={self.mode} requested_enabled={enabled} enabled={self.enabled} "
+            f"disabled_reason={self._disabled_reason if not self.enabled else 'none'}"
+        )
+        if self.mode == "offload":
+            self._log_workspace_state("init")
+
+    def _workspace_dir(self) -> str:
+        from auto_round import envs
+
+        return os.path.abspath(os.path.join(envs.AR_WORK_SPACE, "offload"))
+
+    def _workspace_state(self) -> tuple[bool, bool, int]:
+        workspace = self._workspace_dir()
+        if not os.path.exists(workspace):
+            return False, True, 0
+        if not os.path.isdir(workspace):
+            return True, False, 1
+        try:
+            entry_count = len(os.listdir(workspace))
+        except OSError:
+            entry_count = -1
+        return True, entry_count == 0, entry_count
+
+    def _log_workspace_state(self, phase: str) -> None:
+        exists, empty, entry_count = self._workspace_state()
+        logger.trace(
+            f"OffloadManager.workspace phase={phase} path={self._workspace_dir()} exists={exists} "
+            f"empty={empty} entries={entry_count} skip_non_empty=false"
+        )
+
+    def _set_enabled(self, enabled: bool, reason: str) -> None:
+        if self.enabled != enabled:
+            logger.trace(f"OffloadManager.enabled {self.enabled}->{enabled} reason={reason}")
+        self.enabled = enabled
+        self._disabled_reason = reason
 
     # ------------------------------------------------------------------
     # Context manager
@@ -373,10 +412,15 @@ class OffloadManager:
             Total offloaded size in GB (non-zero only when *clear_memory* is True).
         """
         if not self.enabled:
+            logger.trace(f"OffloadManager.noop mode={self.mode} reason={self._disabled_reason}")
             return 0.0
         if self.mode == "offload" and not self._check_disk_space(model, names):
-            self.enabled = False
+            self._set_enabled(False, "disk_space_check_failed")
+            logger.trace("OffloadManager.cpu_fallback reason=disk_space_check_failed")
             return 0.0
+        if self.mode == "offload" and not self._engaged:
+            self._engaged = True
+            logger.trace("OffloadManager.enabled engage=true mode=offload")
         if isinstance(names, str):
             self._offload(model, names, skip_if_saved=skip_if_saved, overwrite=overwrite)
             return 0.0
@@ -695,9 +739,8 @@ class OffloadManager:
 
     def _ensure_dir(self) -> str:
         if self._tempdir is None:
-            from auto_round import envs
-
-            base_dir = os.path.join(envs.AR_WORK_SPACE, "offload")
+            base_dir = self._workspace_dir()
+            self._log_workspace_state("ensure_dir")
             os.makedirs(base_dir, exist_ok=True)
             self._tempdir = tempfile.mkdtemp(prefix=f"{self._prefix}_", dir=base_dir)
             logger.info(f"OffloadManager ({self._prefix}): tempdir = {self._tempdir}")
