@@ -18,6 +18,7 @@ import functools
 import inspect
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from enum import Enum
@@ -29,6 +30,7 @@ import torch.nn as nn
 import transformers
 from tqdm import tqdm
 
+from auto_round import envs
 from auto_round.compressors.utils import is_mx_fp, is_nv_fp, is_standard_fp
 from auto_round.export.export_to_autoround.utils import check_neq_config
 from auto_round.export.utils import (
@@ -52,6 +54,82 @@ from auto_round.utils import (
     to_standard_regex,
     unsupported_meta_device,
 )
+
+
+VLLM_COMPAT_PREFIX_TRANSLATIONS = (
+    ("model.language_model.", "language_model.model."),
+)
+
+
+def _translate_hf_name_to_vllm_name(layer_name: str) -> str:
+    for hf_prefix, vllm_prefix in VLLM_COMPAT_PREFIX_TRANSLATIONS:
+        if layer_name.startswith(hf_prefix):
+            return layer_name.replace(hf_prefix, vllm_prefix, 1)
+    return layer_name
+
+
+def _get_candidate_extra_config_layer_names(model: torch.nn.Module, layer_config: dict) -> list[str]:
+    names = list(layer_config.keys())
+    names.extend(name for name, _ in model.named_modules())
+    return list(dict.fromkeys(names))
+
+
+def _build_extra_config_for_autoround_export(
+    model: torch.nn.Module,
+    layer_config: dict,
+    quantization_config: dict,
+    scheme_keys: list[str],
+) -> dict:
+    extra_config = {}
+    block_name_to_quantize = quantization_config["block_name_to_quantize"]
+    if isinstance(block_name_to_quantize, str):
+        block_name_to_quantize = block_name_to_quantize.split(",")
+    elif isinstance(block_name_to_quantize, list):
+        for i in range(len(block_name_to_quantize)):
+            block_name_to_quantize[i] = os.path.commonprefix(block_name_to_quantize[i]).rstrip(".")
+
+    for layer_name, cfg in layer_config.items():
+        if not cfg["in_blocks"] and cfg["bits"] <= 8:  # lm head
+            extra_config[layer_name] = {key: cfg.get(key) for key in scheme_keys}
+        elif cfg["in_blocks"] or (
+            block_name_to_quantize is not None and check_start_with_block_name(layer_name, block_name_to_quantize)
+        ):
+            neq_keys = check_neq_config(cfg, **{k: quantization_config[k] for k in scheme_keys})
+            if len(neq_keys) > 0:
+                extra_config[layer_name] = {}
+                for key in neq_keys:
+                    if cfg.get(key) is not None:
+                        extra_config[layer_name][key] = cfg[key]
+
+    regex_config = quantization_config.get("regex_config")
+    if not regex_config:
+        return extra_config
+
+    candidate_layer_names = _get_candidate_extra_config_layer_names(model, layer_config)
+    for name, cfg in regex_config.items():
+        neq_keys = check_neq_config(cfg, **{k: quantization_config[k] for k in scheme_keys})
+        if len(neq_keys) == 0:
+            continue
+
+        literal_names = []
+        pattern = re.compile(to_standard_regex(name))
+        for layer_name in candidate_layer_names:
+            if pattern.search(layer_name):
+                literal_names.append(layer_name)
+
+        for literal_name in literal_names:
+            emitted_names = [literal_name]
+            if envs.AR_EMIT_VLLM_COMPAT_PREFIXES:
+                vllm_name = _translate_hf_name_to_vllm_name(literal_name)
+                if vllm_name != literal_name:
+                    emitted_names.append(vllm_name)
+            for emitted_name in emitted_names:
+                extra_config.setdefault(emitted_name, {})
+                for key in neq_keys:
+                    if cfg.get(key) is not None:
+                        extra_config[emitted_name][key] = cfg[key]
+
+    return extra_config
 
 
 def dynamic_import_quant_linear_for_packing(backend, bits, group_size, sym, act_bits=16):
@@ -272,38 +350,14 @@ def save_quantized_as_autoround(
     processor = kwargs.get("processor", None)
     image_processor = kwargs.get("image_processor", None)
 
-    extra_config = {}
-    block_name_to_quantize = quantization_config["block_name_to_quantize"]
-    if isinstance(block_name_to_quantize, str):
-        block_name_to_quantize = block_name_to_quantize.split(",")
-    elif isinstance(block_name_to_quantize, list):
-        for i in range(len(block_name_to_quantize)):
-            block_name_to_quantize[i] = os.path.commonprefix(block_name_to_quantize[i]).rstrip(".")
-
     scheme_keys = [f.name for f in fields(QuantizationScheme)]
-    for layer_name, cfg in layer_config.items():
-        if not cfg["in_blocks"] and cfg["bits"] <= 8:  # lm head
-            extra_config[layer_name] = {key: cfg.get(key) for key in scheme_keys}
-        elif cfg["in_blocks"] or (
-            block_name_to_quantize is not None and check_start_with_block_name(layer_name, block_name_to_quantize)
-        ):
-            neq_keys = check_neq_config(cfg, **{k: quantization_config[k] for k in scheme_keys})
-            if len(neq_keys) > 0:
-                extra_config[layer_name] = {}
-                for key in neq_keys:
-                    if cfg.get(key) is not None:
-                        extra_config[layer_name][key] = cfg[key]
-
-    regex_config = quantization_config.pop("regex_config")
-    if regex_config is not None:
-        for name, cfg in regex_config.items():
-            regex_name = to_standard_regex(name)
-            neq_keys = check_neq_config(cfg, **{k: quantization_config[k] for k in scheme_keys})
-            if len(neq_keys) > 0:
-                extra_config[regex_name] = {}
-                for key in neq_keys:
-                    if cfg.get(key) is not None:
-                        extra_config[regex_name][key] = cfg[key]
+    extra_config = _build_extra_config_for_autoround_export(
+        model=model,
+        layer_config=layer_config,
+        quantization_config=quantization_config,
+        scheme_keys=scheme_keys,
+    )
+    quantization_config.pop("regex_config")
 
     if len(extra_config) > 0:
         quantization_config["extra_config"] = extra_config
