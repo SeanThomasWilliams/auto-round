@@ -558,6 +558,74 @@ def get_max_memory_with_uma_correction() -> dict:
     return max_memory
 
 
+def _workspace_root() -> str:
+    workspace = os.getenv("AR_WORK_SPACE")
+    if workspace:
+        return os.path.abspath(workspace)
+    return os.path.join(os.path.expanduser("~"), ".cache", "auto-round")
+
+
+def get_offload_workspace_dir() -> str:
+    return os.path.join(_workspace_root(), "offload")
+
+
+def _memory_gb_to_bytes(value: str | None, default_gb: float | None = None) -> int | None:
+    if value is None or value == "":
+        if default_gb is None:
+            return None
+        value = str(default_gb)
+    try:
+        return int(float(value) * 1024**3)
+    except (TypeError, ValueError):
+        if default_gb is None:
+            return None
+        return int(float(default_gb) * 1024**3)
+
+
+def has_memory_overrides() -> bool:
+    return bool(os.getenv("AR_MAX_GPU_MEMORY_GB") or os.getenv("AR_MAX_CPU_MEMORY_GB") or envs.AR_FORCE_DISK_OFFLOAD)
+
+
+def is_single_device_no_offload(requested_device_map) -> bool:
+    devices = [device for device in parse_available_devices(requested_device_map) if device != "cpu"]
+    if not devices:
+        return False
+    resolved_values = _device_map_values(requested_device_map)
+    return len(devices) == 1 and not any(value == "disk" for value in resolved_values)
+
+
+def build_max_memory_dict(device_map=None) -> tuple[dict, str]:
+    offload_dir = get_offload_workspace_dir()
+    os.makedirs(offload_dir, exist_ok=True)
+
+    max_memory = get_max_memory_with_uma_correction()
+    if not has_memory_overrides():
+        return max_memory, offload_dir
+
+    gpu_cap_bytes = _memory_gb_to_bytes(os.getenv("AR_MAX_GPU_MEMORY_GB"), 16 if envs.AR_FORCE_DISK_OFFLOAD else None)
+    cpu_cap_bytes = _memory_gb_to_bytes(os.getenv("AR_MAX_CPU_MEMORY_GB"), 100 if envs.AR_FORCE_DISK_OFFLOAD else None)
+
+    if envs.AR_FORCE_DISK_OFFLOAD or gpu_cap_bytes is not None or cpu_cap_bytes is not None:
+        for device_key in list(max_memory.keys()):
+            if device_key == "cpu":
+                if cpu_cap_bytes is not None:
+                    max_memory[device_key] = cpu_cap_bytes
+            elif device_key == "disk":
+                continue
+            else:
+                if gpu_cap_bytes is not None:
+                    max_memory[device_key] = gpu_cap_bytes
+                elif envs.AR_FORCE_DISK_OFFLOAD:
+                    max_memory[device_key] = 16 * 1024**3
+        if cpu_cap_bytes is not None:
+            max_memory["cpu"] = cpu_cap_bytes
+        elif envs.AR_FORCE_DISK_OFFLOAD:
+            max_memory["cpu"] = 100 * 1024**3
+        if envs.AR_FORCE_DISK_OFFLOAD:
+            max_memory["disk"] = shutil.disk_usage(offload_dir).free
+    return max_memory, offload_dir
+
+
 def _clear_memory_for_cpu_and_cuda(
     tensor: torch.Tensor | list[torch.Tensor] | None = None,
     device_list: tuple | list | str | torch.device | None = None,
@@ -891,23 +959,28 @@ def dispatch_model_no_offload_aware(
     requested_device_map=None,
     target_device: Optional[Union[str, torch.device, int]] = None,
 ):
-    del target_device
     requested_device_map = device_map if requested_device_map is None else requested_device_map
     resolved_values = _device_map_values(device_map)
+    if is_single_device_no_offload(requested_device_map):
+        if target_device is None:
+            devices = [device for device in parse_available_devices(requested_device_map) if device != "cpu"]
+            target_device = devices[0] if devices else None
+        if target_device is not None:
+            return model.to(target_device)
     uses_disk = any(value == "disk" for value in resolved_values)
     if uses_disk:
-        workspace = os.path.abspath(envs.AR_WORK_SPACE)
-        exists, empty, entry_count = _workspace_state(workspace)
-        os.makedirs(workspace, exist_ok=True)
+        offload_dir = get_offload_workspace_dir()
+        exists, empty, entry_count = _workspace_state(offload_dir)
+        os.makedirs(offload_dir, exist_ok=True)
         logger.trace(
-            f"dispatch.offload_workspace requested={requested_device_map} path={workspace} "
+            f"dispatch.offload_workspace requested={requested_device_map} path={offload_dir} "
             f"exists={exists} empty={empty} entries={entry_count} skip_non_empty=false"
         )
-        return dispatch_model(model, device_map=device_map, offload_dir=workspace)
+        return dispatch_model(model, device_map=device_map, offload_dir=offload_dir)
     if any(value == "cpu" for value in resolved_values):
         logger.trace(
             f"dispatch.cpu_fallback requested={requested_device_map} resolved_devices={resolved_values} "
-            f"offload_workspace={os.path.abspath(envs.AR_WORK_SPACE)}"
+            f"offload_workspace={get_offload_workspace_dir()}"
         )
     return dispatch_model(model, device_map=device_map)
 

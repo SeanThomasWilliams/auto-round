@@ -17,6 +17,7 @@ import os
 import re
 import sys
 
+from auto_round import envs
 from auto_round.auto_scheme import AutoScheme
 from auto_round.compressors import BaseCompressor
 from auto_round.eval.eval_cli import EvalArgumentParser, eval, eval_task_by_task

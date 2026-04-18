@@ -21,10 +21,13 @@ from transformers.utils.versions import require_version
 
 from auto_round.utils import (
     DEVICE_ENVIRON_VARIABLE_MAPPING,
+    build_max_memory_dict,
     detect_device,
     dispatch_model_block_wise,
+    dispatch_model_no_offload_aware,
     get_device_and_parallelism,
     get_model_dtype,
+    has_memory_overrides,
     is_diffusion_model,
     set_cuda_visible_devices,
 )
@@ -358,10 +361,14 @@ def eval_task_by_task(
         batch_size = "auto:8"
 
     if not isinstance(model, str) and parallelism:
-        from accelerate import dispatch_model, infer_auto_device_map
+        from accelerate import infer_auto_device_map
 
-        device_map = infer_auto_device_map(model)
-        model = dispatch_model(model, device_map=device_map)
+        if has_memory_overrides():
+            max_memory, _ = build_max_memory_dict()
+            device_map = infer_auto_device_map(model, max_memory=max_memory)
+        else:
+            device_map = infer_auto_device_map(model)
+        model = dispatch_model_no_offload_aware(model, device_map=device_map, requested_device_map="auto")
         parallelism = False
         is_gguf_file = False
         gguf_file = None

@@ -55,6 +55,7 @@ from typing import Any, Optional, Union
 import torch
 
 from auto_round.logger import logger
+from auto_round.utils.device import get_offload_workspace_dir
 from auto_round.utils.model import get_module
 
 __all__ = ["OffloadManager"]
@@ -275,13 +276,14 @@ class OffloadManager:
     ):
         from auto_round import envs
 
-        self.enabled = enabled and not envs.AR_DISABLE_OFFLOAD
+        self.enabled = enabled
         self.mode = mode
         self.model_dir = model_dir
         self.cache_numel = cache_numel
         self._prefix = offload_dir_prefix
-        self._disabled_reason = "disabled_by_env" if enabled and envs.AR_DISABLE_OFFLOAD else "disabled_by_config"
+        self._disabled_reason = "disabled_by_config"
         self._engaged = False
+        self._last_noop_reason_logged: Optional[str] = None
 
         # Disk state (offload mode)
         self._tempdir: Optional[str] = None
@@ -307,9 +309,7 @@ class OffloadManager:
             self._log_workspace_state("init")
 
     def _workspace_dir(self) -> str:
-        from auto_round import envs
-
-        return os.path.abspath(os.path.join(envs.AR_WORK_SPACE, "offload"))
+        return get_offload_workspace_dir()
 
     def _workspace_state(self) -> tuple[bool, bool, int]:
         workspace = self._workspace_dir()
@@ -335,6 +335,7 @@ class OffloadManager:
             logger.trace(f"OffloadManager.enabled {self.enabled}->{enabled} reason={reason}")
         self.enabled = enabled
         self._disabled_reason = reason
+        self._last_noop_reason_logged = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -412,7 +413,9 @@ class OffloadManager:
             Total offloaded size in GB (non-zero only when *clear_memory* is True).
         """
         if not self.enabled:
-            logger.trace(f"OffloadManager.noop mode={self.mode} reason={self._disabled_reason}")
+            if self._last_noop_reason_logged != self._disabled_reason:
+                logger.trace(f"OffloadManager.noop mode={self.mode} reason={self._disabled_reason}")
+                self._last_noop_reason_logged = self._disabled_reason
             return 0.0
         if self.mode == "offload" and not self._check_disk_space(model, names):
             self._set_enabled(False, "disk_space_check_failed")
@@ -473,9 +476,7 @@ class OffloadManager:
                 total_bytes += tensor.numel() * tensor.element_size()
         # torch.save adds serialization overhead; use 1.2x safety margin
         required_bytes = int(total_bytes * 1.2)
-        from auto_round import envs
-
-        target_dir = os.path.join(envs.AR_WORK_SPACE, "offload")
+        target_dir = get_offload_workspace_dir()
         os.makedirs(target_dir, exist_ok=True)
         free_bytes = shutil.disk_usage(target_dir).free
         if free_bytes < required_bytes:

@@ -116,7 +116,8 @@ from auto_round.utils.device import (
     clear_memory_if_reached_threshold,
     dispatch_model_no_offload_aware,
     get_major_device,
-    get_max_memory_with_uma_correction,
+    build_max_memory_dict,
+    has_memory_overrides,
     log_inferred_device_map,
     parse_available_devices,
     set_auto_device_map_for_block_with_tuning,
@@ -319,6 +320,7 @@ class BaseCompressor(object):
                         "Please consider submitting an issue to https://github.com/intel/auto-round/issues"
                     )
 
+            self._log_phase_transition("load_model", "start")
             model, tokenizer = llm_load_model(
                 model,
                 platform=platform,
@@ -326,6 +328,7 @@ class BaseCompressor(object):
                 model_dtype=model_dtype,
                 trust_remote_code=self.trust_remote_code,
             )
+            self._log_phase_transition("load_model", "end")
         elif tokenizer is None and not self.diffusion and iters > 0:
             raise ValueError("A tokenizer must be set for non-str model input")
         if unsupported_meta_device(model):
@@ -690,6 +693,12 @@ class BaseCompressor(object):
     def _log_packing_state(self, phase: str, name: str) -> None:
         logger.trace(
             f"{phase} name={name} rss_gb={self._current_rss_gb():.2f} vram_gb={self._current_vram_gb():.2f}"
+        )
+
+    def _log_phase_transition(self, name: str, status: str) -> None:
+        logger.trace(
+            f"phase_transition name={name} status={status} rss_gb={self._current_rss_gb():.2f} "
+            f"vram_gb={self._current_vram_gb():.2f}"
         )
 
     def _reconcile_bits_and_dtype(self, config: dict, prefix: str = ""):
@@ -1377,6 +1386,13 @@ class BaseCompressor(object):
         if self.amp and self.model.dtype != self.amp_dtype:
             self.model.to(self.amp_dtype)
 
+        cpu_offload_active = self.low_cpu_mem_usage and not self.is_immediate_saving
+        packing_active = self.is_immediate_packing
+        if cpu_offload_active:
+            self._log_phase_transition("cpu_offload", "start")
+        if packing_active:
+            self._log_phase_transition("packing", "start")
+
         all_to_quantized_module_names: list[str] = [n for n, m in self.model.named_modules() if check_to_quantized(m)]
         self.all_to_quantized_module_names = all_to_quantized_module_names
 
@@ -1529,8 +1545,14 @@ class BaseCompressor(object):
         convert_module_to_hp_if_necessary(self.model, self.amp_dtype, self.device)
         if self.low_cpu_mem_usage:
             self._offloader.reload(self.model)
+        if cpu_offload_active:
+            self._log_phase_transition("cpu_offload", "end")
         if self.is_immediate_saving:
+            self._log_phase_transition("shard_save", "start")
             shard_writer(self, is_finalize=True)
+            self._log_phase_transition("shard_save", "end")
+        if packing_active:
+            self._log_phase_transition("packing", "end")
 
         self.quantized = True
         return self.model, self.layer_config
@@ -1793,6 +1815,8 @@ class BaseCompressor(object):
         The quantized model and layer configurations.
         """
 
+        self._log_phase_transition("quantization", "start")
+
         self._check_compatibility()
         formats = self.formats if hasattr(self, "formats") else None
         # It is best to modify the model structure in the quantize function and check the format,
@@ -1830,7 +1854,9 @@ class BaseCompressor(object):
             self._adjust_immediate_packing_and_saving()
 
         if self.iters == 0:
-            return self._quantize_rtn()
+            result = self._quantize_rtn()
+            self._log_phase_transition("quantization", "end")
+            return result
 
         if bool(self.quant_block_list):
             all_blocks = self.quant_block_list
@@ -1871,9 +1897,11 @@ class BaseCompressor(object):
         logger.info("caching done")
         if self.low_cpu_mem_usage:
             if self.is_model_patched and not self.is_immediate_saving:
+                self._log_phase_transition("cpu_offload", "start")
                 self._offloader(self.model, all_blocks, clear_memory=True, device_list=self.device_list)
                 if not self._offloader.enabled:
                     self.low_cpu_mem_usage = False
+                self._log_phase_transition("cpu_offload", "end")
             else:
                 self.low_cpu_mem_usage = False
         if len(all_blocks) > 1:
@@ -1882,6 +1910,8 @@ class BaseCompressor(object):
             pbar = tqdm(range(0, len(all_blocks[0]), self.nblocks))  # move the alg warning outside pbar
 
         start_time = time.time()
+        if self.is_immediate_packing:
+            self._log_phase_transition("packing", "start")
         for block_names in all_blocks:
             inputs = all_inputs[block_names[0]]
             all_inputs.pop(block_names[0])
@@ -1919,14 +1949,19 @@ class BaseCompressor(object):
         if self.low_cpu_mem_usage:
             self._offloader.reload(self.model)
         self._quantize_layers(layer_names, all_inputs)
+        if self.is_immediate_packing:
+            self._log_phase_transition("packing", "end")
 
         convert_module_to_hp_if_necessary(self.model, self.amp_dtype, self.device, to_cpu=True)
         if self.is_immediate_saving:
+            self._log_phase_transition("shard_save", "start")
             shard_writer(self, is_finalize=True)
+            self._log_phase_transition("shard_save", "end")
 
         end_time = time.time()
         cost_time = end_time - start_time
         logger.info(f"quantization tuning time {cost_time}")
+        self._log_phase_transition("quantization", "end")
 
         # Dump a summary
         quantized_layers = []
@@ -2147,6 +2182,7 @@ class BaseCompressor(object):
             nsamples (int): The number of samples to use for calibration.
             bs (int): The number of samples to use for calibration
         """
+        self._log_phase_transition("calibration", "start")
         from auto_round.calib_dataset import get_dataloader
 
         need_attention_mask = True
@@ -2288,6 +2324,7 @@ class BaseCompressor(object):
                 f"An insufficient number of samples likely reduces the accuracy of the quantized model. "
                 f"Target samples count is {nsamples}, while valid samples count is {total_cnt}"
             )
+        self._log_phase_transition("calibration", "end")
 
     @torch.no_grad()
     def try_cache_inter_data_gpucpu(self, block_names, nsamples, layer_names=None, last_cache_name=None):
@@ -2350,7 +2387,8 @@ class BaseCompressor(object):
                         no_split_modules = list(getattr(self.model, "_no_split_modules", []))
                         devices = parse_available_devices(self.device_map)
 
-                        max_memory = get_max_memory_with_uma_correction()
+                        max_memory, _ = build_max_memory_dict()
+                        use_overrides = has_memory_overrides()
                         new_max_memory = {}
                         if "cpu" not in devices:
                             devices.append("cpu")
@@ -2367,10 +2405,16 @@ class BaseCompressor(object):
                                 # Skip devices that are not reported by accelerate's max_memory.
                                 # This is expected when a device is unavailable or cannot provide memory info.
                                 continue
-                            # Use 90% of the reported max memory to leave headroom for activations,
-                            # temporary tensors, other processes, and allocator fragmentation, reducing
-                            # the chance of runtime OOM while still utilizing most available memory.
-                            new_max_memory[device] = max_memory[device] * 0.9
+                            device_max_memory = max_memory[device]
+                            if not use_overrides:
+                                # Use 90% of the reported max memory to leave headroom for activations,
+                                # temporary tensors, other processes, and allocator fragmentation, reducing
+                                # the chance of runtime OOM while still utilizing most available memory.
+                                device_max_memory = device_max_memory * 0.9
+                            new_max_memory[device] = device_max_memory
+
+                        if use_overrides and "disk" in max_memory:
+                            new_max_memory["disk"] = max_memory["disk"]
 
                         # If non-CPU devices were requested but none survived, fall back to CPU caching
                         # via the OOM handler below, avoiding unnecessary dispatch overhead.
@@ -2404,21 +2448,14 @@ class BaseCompressor(object):
                                 " Please consider using more cards."
                             )
 
-                        try:
-                            self.model = dispatch_model(self.model, device_map=device_map)
-                            if has_ngram_embeddings:
-                                self.model.model.ngram_embeddings = raw_ngram_embeddings
-                        except ValueError as e:
-                            if "offload_dir" in e.__str__():
-                                logger.warning(
-                                    f"Due to insufficient resources, disk is used to store the model."
-                                    f" `offload_dir={envs.AR_WORK_SPACE}`"
-                                )
-                                self.model = dispatch_model(
-                                    self.model, device_map=device_map, offload_dir=envs.AR_WORK_SPACE
-                                )
-                            else:
-                                raise
+                        self.model = dispatch_model_no_offload_aware(
+                            self.model,
+                            device_map=device_map,
+                            requested_device_map=self.device_map,
+                            target_device=self.device,
+                        )
+                        if has_ngram_embeddings:
+                            self.model.model.ngram_embeddings = raw_ngram_embeddings
                     else:
                         self.model = self.model.to(self.device)
 
